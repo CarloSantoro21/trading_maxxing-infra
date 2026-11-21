@@ -1,0 +1,221 @@
+name: Terraform
+
+# - En cada PR (y push a develop/main): fmt, init sin backend, validate, tflint y pruebas
+#   con provider simulado. No necesita secrets.
+# - En cada PR, si existen los secrets CLOUDFLARE_API_TOKEN y TF_API_TOKEN: `terraform plan`
+#   de dev y prod contra HCP Terraform, publicado como comentario en el PR.
+# - `apply` solo a mano (workflow_dispatch) con el environment de GitHub `dev` o `prod`;
+#   `prod` debe tener "Required reviewers" en Settings > Environments.
+
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop, main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Ambiente a aplicar
+        type: choice
+        options: [dev, prod]
+        required: true
+      action:
+        description: plan solo muestra cambios; apply los aplica
+        type: choice
+        options: [plan, apply]
+        default: plan
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-${{ github.ref }}-${{ inputs.environment || 'ci' }}
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TERRAFORM_VERSION: "1.9.8"
+
+jobs:
+  validate:
+    name: fmt + validate + test (${{ matrix.env }})
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        env: [dev, prod]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive -diff
+
+      - name: terraform init (sin backend)
+        working-directory: envs/${{ matrix.env }}
+        run: terraform init -backend=false
+
+      - name: terraform validate
+        working-directory: envs/${{ matrix.env }}
+        run: terraform validate
+
+      - name: terraform test (provider simulado)
+        working-directory: envs/${{ matrix.env }}
+        run: terraform test
+
+  tflint:
+    name: tflint (opcional)
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # Es una revisión de estilo: avisa pero no bloquea el PR.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: v0.53.0
+      - name: tflint --init
+        run: tflint --init --config "$GITHUB_WORKSPACE/.tflint.hcl"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: tflint
+        run: tflint --recursive --config "$GITHUB_WORKSPACE/.tflint.hcl" --format compact
+
+  plan:
+    name: plan (${{ matrix.env }})
+    if: github.event_name == 'pull_request'
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        env: [dev, prod]
+    env:
+      HAS_SECRETS: ${{ secrets.CLOUDFLARE_API_TOKEN != '' && secrets.TF_API_TOKEN != '' }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      TF_CLOUD_ORGANIZATION: ${{ vars.TF_CLOUD_ORGANIZATION }}
+      TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      TF_VAR_access_team_name: ${{ vars.ACCESS_TEAM_NAME }}
+      TF_VAR_access_allowed_emails: ${{ secrets.ACCESS_ALLOWED_EMAILS }}
+      TF_VAR_workers_dev_subdomain: ${{ vars.WORKERS_DEV_SUBDOMAIN }}
+    steps:
+      - name: Sin secrets, no hay plan
+        if: env.HAS_SECRETS != 'true'
+        run: echo "::notice::Faltan CLOUDFLARE_API_TOKEN o TF_API_TOKEN; se omite terraform plan."
+
+      - uses: actions/checkout@v4
+        if: env.HAS_SECRETS == 'true'
+
+      - uses: hashicorp/setup-terraform@v3
+        if: env.HAS_SECRETS == 'true'
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+      - name: terraform init
+        if: env.HAS_SECRETS == 'true'
+        working-directory: envs/${{ matrix.env }}
+        run: terraform init
+
+      - name: terraform plan
+        id: plan
+        if: env.HAS_SECRETS == 'true'
+        working-directory: envs/${{ matrix.env }}
+        run: |
+          set +e
+          terraform plan -no-color -lock=false -detailed-exitcode -out=tfplan > plan.txt 2>&1
+          code=$?
+          set -e
+          cat plan.txt
+          echo "exitcode=$code" >> "$GITHUB_OUTPUT"
+          # 0 = sin cambios, 2 = hay cambios; 1 = error.
+          if [ "$code" -eq 1 ]; then exit 1; fi
+
+      - name: Comentar el plan en el PR
+        if: always() && env.HAS_SECRETS == 'true' && steps.plan.outcome != 'skipped'
+        uses: actions/github-script@v7
+        env:
+          ENV_NAME: ${{ matrix.env }}
+        with:
+          script: |
+            const fs = require('fs');
+            const envName = process.env.ENV_NAME;
+            const path = `envs/${envName}/plan.txt`;
+            let plan = fs.existsSync(path) ? fs.readFileSync(path, 'utf8') : 'No se generó el plan.';
+            const max = 60000;
+            if (plan.length > max) plan = plan.slice(-max) + '\n... (recortado)';
+            const marker = `<!-- terraform-plan-${envName} -->`;
+            const body = `${marker}\n### Terraform plan: \`${envName}\`\n\n<details><summary>Ver plan</summary>\n\n\`\`\`\n${plan}\n\`\`\`\n</details>\n\nCommit: ${context.sha.substring(0, 7)}`;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number,
+            });
+            const previous = comments.find(c => c.body && c.body.includes(marker));
+            if (previous) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo, comment_id: previous.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body,
+              });
+            }
+
+  apply:
+    name: ${{ inputs.action }} ${{ inputs.environment }}
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # El environment de GitHub da los secrets por ambiente y, en prod, pide aprobación.
+    environment: ${{ inputs.environment }}
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      TF_CLOUD_ORGANIZATION: ${{ vars.TF_CLOUD_ORGANIZATION }}
+      TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      TF_VAR_access_team_name: ${{ vars.ACCESS_TEAM_NAME }}
+      TF_VAR_access_allowed_emails: ${{ secrets.ACCESS_ALLOWED_EMAILS }}
+      TF_VAR_workers_dev_subdomain: ${{ vars.WORKERS_DEV_SUBDOMAIN }}
+    steps:
+      - name: prod solo desde main
+        if: inputs.environment == 'prod' && inputs.action == 'apply' && github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::El apply de prod solo se permite desde la rama main."
+          exit 1
+
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+      - name: terraform init
+        working-directory: envs/${{ inputs.environment }}
+        run: terraform init
+
+      - name: terraform plan
+        working-directory: envs/${{ inputs.environment }}
+        run: terraform plan -out=tfplan
+
+      - name: terraform apply
+        if: inputs.action == 'apply'
+        working-directory: envs/${{ inputs.environment }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: Resumen de outputs
+        if: inputs.action == 'apply'
+        working-directory: envs/${{ inputs.environment }}
+        run: |
+          {
+            echo "### Outputs de ${{ inputs.environment }}"
+            echo '```'
+            terraform output
+            echo '```'
+            echo "Los outputs sensibles (token del motor) se leen con: terraform output -raw motor_service_token_client_secret"
+          } >> "$GITHUB_STEP_SUMMARY"

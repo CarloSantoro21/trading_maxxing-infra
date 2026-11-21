@@ -1,0 +1,11 @@
+# Copia este archivo a terraform.tfvars (está en .gitignore) y llena los valores.
+# En CI estos valores llegan como TF_VAR_* desde variables/secrets de GitHub.
+
+cloudflare_account_id = "0123456789abcdef0123456789abcdef"
+access_team_name      = "trading-maxxing"
+access_allowed_emails = ["persona1@example.com", "persona2@example.com"]
+
+# Opcional: protege también la API en workers.dev (tm-api*.<subdominio>.workers.dev).
+# workers_dev_subdomain = "mi-subdominio"
+
+# d1_location_hint = "wnam"
