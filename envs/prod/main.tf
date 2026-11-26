@@ -5,7 +5,9 @@ locals {
   pages_name    = "tm-web"
   worker_name   = "tm-api"
   api_hostname  = try(length(var.workers_dev_subdomain), 0) == 0 ? null : "${local.worker_name}.${var.workers_dev_subdomain}.workers.dev"
-  web_hostname  = "${local.pages_name}.pages.dev"
+  # El subdominio real lo devuelve la API de Cloudflare: si <pages_name>.pages.dev
+  # ya existe en otra cuenta, Pages le agrega un sufijo (p. ej. tm-web-9xy.pages.dev).
+  web_hostname  = module.pages.subdomain
   pages_env_var = { APP_ENV = local.env }
 
   # El proveedor One-time PIN lo crea envs/dev (solo puede haber uno por cuenta).
