@@ -69,9 +69,13 @@ resource "cloudflare_zero_trust_access_application" "web" {
   app_launcher_visible      = false
   allowed_idps              = [local.otp_idp_id]
   auto_redirect_to_identity = true
+  # Sin sesión válida devuelve 401 (no redirige a login) para peticiones del motor y del
+  # smoke test/UAT, que mandan el service token en headers.
+  service_auth_401_redirect = true
 
   policies = [
-    { id = cloudflare_zero_trust_access_policy.allow_team.id, precedence = 1 },
+    { id = cloudflare_zero_trust_access_policy.motor_service_token.id, precedence = 1 },
+    { id = cloudflare_zero_trust_access_policy.allow_team.id, precedence = 2 },
   ]
 }
 
