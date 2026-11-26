@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/img/logo.svg" alt="trading_maxxing" width="420" />
+</p>
+
 # trading_maxxing-infra
 
 Terraform de Cloudflare para [trading_maxxing](https://github.com/CarloSantoro21/trading_maxxing)
